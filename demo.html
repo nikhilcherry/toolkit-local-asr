@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LocalASR Demo</title>
+<style>
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+  h1 { margin-bottom: 0.25rem; }
+  .sub { color: #666; margin-top: 0; }
+  .controls { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; margin: 1rem 0; }
+  button { padding: 0.55rem 1.1rem; font-size: 0.95rem; border-radius: 6px; border: 1px solid #ccc; background: #f7f7f7; cursor: pointer; }
+  button:hover:not(:disabled) { background: #eee; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.active { background: #ffe4e4; border-color: #e88; }
+  #status { padding: 0.6rem 0.8rem; background: #f0f4ff; border-radius: 6px; color: #334; font-size: 0.9rem; margin: 1rem 0; }
+  .stats { display: flex; gap: 1.5rem; margin-bottom: 1rem; font-size: 0.9rem; color: #444; }
+  .stats b { color: #b00; }
+  #transcript { border: 1px solid #ddd; border-radius: 8px; padding: 0.5rem 0.85rem; max-height: 420px; overflow-y: auto; }
+  .line { padding: 0.5rem 0; border-bottom: 1px solid #f0f0f0; }
+  .line:last-child { border-bottom: none; }
+  .line small { display: block; color: #999; margin-top: 0.15rem; font-size: 0.78rem; }
+  input[type="file"] { font-size: 0.9rem; }
+</style>
+</head>
+<body>
+
+<h1>LocalASR Demo</h1>
+<p class="sub">On-device Whisper transcription — WebGPU, worker-isolated, drops stale jobs under load.</p>
+
+<div class="controls">
+  <button id="initBtn">Init model</button>
+  <button id="micBtn" disabled>Start mic</button>
+  <input type="file" id="fileInput" accept="audio/*" disabled>
+</div>
+
+<div id="status">not initialized</div>
+
+<div class="stats">
+  <span>Chunks transcribed: <b id="resultCount">0</b></span>
+  <span>Dropped (stale): <b id="dropped">0</b></span>
+</div>
+
+<div id="transcript"></div>
+
+<script type="module">
+  import { LocalASR } from './local-asr.js';
+
+  const asr = new LocalASR({
+    model: 'onnx-community/whisper-base',
+    language: 'english',
+    device: 'webgpu',
+    maxQueue: 2,
+    workerUrl: './asr-worker.js',
+  });
+
+  const initBtn = document.getElementById('initBtn');
+  const micBtn = document.getElementById('micBtn');
+  const fileInput = document.getElementById('fileInput');
+  const statusEl = document.getElementById('status');
+  const transcriptEl = document.getElementById('transcript');
+  const droppedEl = document.getElementById('dropped');
+  const resultCountEl = document.getElementById('resultCount');
+
+  let droppedCount = 0;
+  let resultCount = 0;
+
+  asr.on('status', (text) => {
+    statusEl.textContent = text;
+  });
+
+  asr.on('result', ({ text, t0, t1, ms }) => {
+    resultCount += 1;
+    resultCountEl.textContent = String(resultCount);
+
+    const line = document.createElement('div');
+    line.className = 'line';
+    line.textContent = text;
+    const meta = document.createElement('small');
+    meta.textContent = `${(t0 / 1000).toFixed(1)}s – ${(t1 / 1000).toFixed(1)}s · ${ms}ms inference`;
+    line.appendChild(meta);
+    transcriptEl.prepend(line);
+  });
+
+  asr.on('dropped', () => {
+    droppedCount += 1;
+    droppedEl.textContent = String(droppedCount);
+  });
+
+  initBtn.addEventListener('click', async () => {
+    initBtn.disabled = true;
+    statusEl.textContent = 'initializing…';
+    try {
+      await asr.init();
+      statusEl.textContent = 'ready';
+      micBtn.disabled = false;
+      fileInput.disabled = false;
+    } catch (err) {
+      statusEl.textContent = `init failed: ${err.message}`;
+      initBtn.disabled = false;
+    }
+  });
+
+  // ---- Mic capture: simple inline 4s chunker (no MicVAD import) ----
+  // Uses an AudioWorklet purely for capture/chunking — no VAD, no gating,
+  // just fixed 4-second windows fed straight to transcribe().
+
+  const CHUNK_WORKLET_SOURCE = `
+    class ChunkerProcessor extends AudioWorkletProcessor {
+      constructor(options) {
+        super();
+        const { frameSamples } = options.processorOptions;
+        this._buffer = new Float32Array(frameSamples);
+        this._writeIndex = 0;
+      }
+      process(inputs) {
+        const input = inputs[0];
+        if (input && input.length > 0) {
+          const channel = input[0];
+          for (let i = 0; i < channel.length; i++) {
+            this._buffer[this._writeIndex++] = channel[i];
+            if (this._writeIndex >= this._buffer.length) {
+              const copy = this._buffer.slice(0);
+              this.port.postMessage(copy, [copy.buffer]);
+              this._writeIndex = 0;
+            }
+          }
+        }
+        return true;
+      }
+    }
+    registerProcessor('chunker-processor', ChunkerProcessor);
+  `;
+
+  let micActive = false;
+  let micStream = null;
+  let micCtx = null;
+  let micSource = null;
+  let micWorklet = null;
+  let micBlobUrl = null;
+
+  micBtn.addEventListener('click', async () => {
+    if (micActive) {
+      stopMic();
+      return;
+    }
+    await startMic();
+  });
+
+  async function startMic() {
+    const SAMPLE_RATE = 16000;
+    const CHUNK_SEC = 4;
+
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1, sampleRate: SAMPLE_RATE },
+    });
+    micCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
+    if (micCtx.state === 'suspended') await micCtx.resume();
+
+    const blob = new Blob([CHUNK_WORKLET_SOURCE], { type: 'application/javascript' });
+    micBlobUrl = URL.createObjectURL(blob);
+    await micCtx.audioWorklet.addModule(micBlobUrl);
+
+    micSource = micCtx.createMediaStreamSource(micStream);
+    micWorklet = new AudioWorkletNode(micCtx, 'chunker-processor', {
+      processorOptions: { frameSamples: SAMPLE_RATE * CHUNK_SEC },
+    });
+
+    let chunkStart = performance.now();
+    micWorklet.port.onmessage = (event) => {
+      const audio = event.data;
+      const t1 = performance.now();
+      const t0 = t1 - (audio.length / SAMPLE_RATE) * 1000;
+      asr.transcribe(audio, t0, t1);
+      chunkStart = t1;
+    };
+
+    micSource.connect(micWorklet);
+    // Never connected to micCtx.destination — capture only, no playback/echo.
+
+    micActive = true;
+    micBtn.textContent = 'Stop mic';
+    micBtn.classList.add('active');
+  }
+
+  function stopMic() {
+    if (micWorklet) { micWorklet.port.onmessage = null; micWorklet.disconnect(); }
+    if (micSource) micSource.disconnect();
+    if (micStream) micStream.getTracks().forEach((t) => t.stop());
+    if (micCtx) micCtx.close();
+    if (micBlobUrl) URL.revokeObjectURL(micBlobUrl);
+
+    micStream = null; micCtx = null; micSource = null; micWorklet = null; micBlobUrl = null;
+    micActive = false;
+    micBtn.textContent = 'Start mic';
+    micBtn.classList.remove('active');
+  }
+
+  // ---- File path: decode any browser-supported audio file, resample to
+  // 16kHz mono, transcribe. Makes the tool testable without a mic. ----
+
+  fileInput.addEventListener('change', async () => {
+    const file = fileInput.files[0];
+    if (!file) return;
+
+    statusEl.textContent = `decoding ${file.name}…`;
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const decodeCtx = new AudioContext();
+      const decoded = await decodeCtx.decodeAudioData(arrayBuffer);
+      await decodeCtx.close();
+
+      const mono16k = await resampleTo16kMono(decoded);
+      statusEl.textContent = `transcribing ${file.name}…`;
+      asr.transcribe(mono16k, 0, decoded.duration * 1000);
+    } catch (err) {
+      statusEl.textContent = `file decode failed: ${err.message}`;
+    } finally {
+      fileInput.value = '';
+    }
+  });
+
+  /**
+   * @param {AudioBuffer} audioBuffer
+   * @returns {Promise<Float32Array>} mono samples resampled to 16kHz
+   */
+  async function resampleTo16kMono(audioBuffer) {
+    const targetRate = 16000;
+    const offlineCtx = new OfflineAudioContext(
+      1,
+      Math.ceil(audioBuffer.duration * targetRate),
+      targetRate
+    );
+    const source = offlineCtx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(offlineCtx.destination);
+    source.start(0);
+    const rendered = await offlineCtx.startRendering();
+    return rendered.getChannelData(0);
+  }
+</script>
+</body>
+</html>
