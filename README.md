@@ -96,3 +96,20 @@ Then open `http://localhost:8000/demo.html`.
 MicVAD's `'chunk'` event (`{ audio, t0, t1 }`) feeds `transcribe()` directly;
 the `t0`/`t1` on each `'result'` feed straight into
 `AttributionFuser.attribute(t0, t1)`.
+
+## Tests
+
+```bash
+node --test
+```
+
+`init()`/`transcribe()` and the worker's `pipeline()` calls need a Worker
+context and the transformers.js CDN import, neither available in plain
+Node. The queue-drop policy itself (described above) is pulled out into
+`transcribe-queue.js` — a small, dependency-free `TranscribeQueue` class
+that `asr-worker.js` now delegates to instead of managing a plain array
+inline — so it's independently testable: FIFO ordering, eviction exactly
+at capacity, a burst well past capacity, and why the currently-running
+job can never be evicted (it's removed from the queue via `shift()` the
+moment inference starts, so it was never eligible to begin with). 7
+tests, no dependencies required.

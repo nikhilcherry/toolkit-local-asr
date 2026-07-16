@@ -11,6 +11,7 @@
  */
 
 import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.2';
+import { TranscribeQueue } from './transcribe-queue.js';
 
 // Model files are only ever fetched from the hub/CDN cache, never from a
 // same-origin /models folder that doesn't exist in this standalone tool.
@@ -20,11 +21,9 @@ env.allowLocalModels = false;
 let transcriber = null;
 /** @type {string|null} */
 let language = 'english';
-/** @type {number} */
-let maxQueue = 2;
 
-/** @type {{id: number, t0: number, t1: number, audio: Float32Array}[]} */
-const queue = [];
+/** @type {TranscribeQueue} */
+const queue = new TranscribeQueue(2);
 let busy = false;
 
 self.onmessage = (event) => {
@@ -41,7 +40,7 @@ self.onmessage = (event) => {
  */
 async function handleInit(msg) {
   language = msg.language;
-  maxQueue = msg.maxQueue ?? 2;
+  queue.maxQueue = msg.maxQueue ?? 2;
 
   const model = msg.model;
   const requestedDevice = msg.device ?? 'webgpu';
@@ -95,11 +94,10 @@ async function handleInit(msg) {
 function handleTranscribe(msg) {
   // Drop the oldest QUEUED job (never the one currently running) once at
   // capacity, so a burst of chunks can't grow an ever-widening backlog.
-  if (queue.length >= maxQueue) {
-    const stale = queue.shift();
-    self.postMessage({ type: 'dropped', t0: stale.t0, t1: stale.t1 });
+  const evicted = queue.push({ id: msg.id, t0: msg.t0, t1: msg.t1, audio: msg.audio });
+  if (evicted) {
+    self.postMessage({ type: 'dropped', t0: evicted.t0, t1: evicted.t1 });
   }
-  queue.push({ id: msg.id, t0: msg.t0, t1: msg.t1, audio: msg.audio });
   processQueue();
 }
 
