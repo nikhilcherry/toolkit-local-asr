@@ -1,11 +1,29 @@
 # toolkit-local-asr
 
+<p align="center">
+  <img alt="js" src="https://img.shields.io/badge/JavaScript-zero_npm_deps-F7DF1E">
+  <img alt="whisper" src="https://img.shields.io/badge/Whisper-transformers.js-4285F4">
+  <img alt="webgpu" src="https://img.shields.io/badge/WebGPU-with_WASM_fallback-9333ea">
+  <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
+</p>
+
 Standalone, on-device speech-to-text for the browser. Wraps Whisper (via
 [transformers.js](https://huggingface.co/docs/transformers.js)) in a Web
 Worker, runs on WebGPU with automatic WASM fallback, and keeps a small job
 queue that drops stale work so live captions never lag further behind
 reality than a couple of chunks. Plain ES modules, zero npm dependencies,
 no build step — just `python3 -m http.server`.
+
+```mermaid
+flowchart LR
+    M["Main thread\nLocalASR"] -->|"transcribe(audio, t0, t1)"| Q["Job queue\n(maxQueue deep)"]
+    Q -->|"queue full"| DROP["drop oldest queued job\nfires 'dropped'"]
+    Q --> W["Web Worker\nasr-worker.js"]
+    W -->|"WebGPU available"| GPU["Whisper on WebGPU"]
+    W -->|"WebGPU unavailable"| WASM["Whisper on WASM"]
+    GPU --> R["fires 'result'\n{text, t0, t1, ms}"]
+    WASM --> R
+```
 
 ## Usage
 
@@ -113,3 +131,7 @@ at capacity, a burst well past capacity, and why the currently-running
 job can never be evicted (it's removed from the queue via `shift()` the
 moment inference starts, so it was never eligible to begin with). 7
 tests, no dependencies required.
+
+## License
+
+MIT
