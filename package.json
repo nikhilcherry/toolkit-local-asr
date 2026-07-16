@@ -1,0 +1,11 @@
+{
+  "name": "toolkit-local-asr",
+  "version": "1.0.0",
+  "description": "On-device Whisper speech-to-text for the browser — transformers.js in a Web Worker with WebGPU/WASM fallback and a stale-job-dropping queue.",
+  "type": "module",
+  "main": "local-asr.js",
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "MIT"
+}

@@ -40,11 +40,11 @@ asr.destroy();    // terminate the worker
 ## API reference
 
 - `new LocalASR(options)` — `model`, `language`, `device`, `maxQueue`, `workerUrl` (all optional, defaults shown above).
-- `asr.init()` — async, spins up the worker and loads/warms the model. Resolves once the model can accept jobs. Rejects only if both WebGPU and WASM fail to load.
-- `asr.transcribe(float32Audio, t0, t1)` — fire-and-forget. `t0`/`t1` are opaque to LocalASR — pass through whatever timestamps your source uses (e.g. MicVAD's `performance.now()`-based chunk bounds); they're echoed back unchanged on `'result'`/`'dropped'`.
+- `asr.init()` — async, spins up the worker and loads/warms the model. Resolves once the model can accept jobs. Rejects only if both WebGPU and WASM fail to load. A failed load is not cached: the dead worker is torn down and a later `init()` retries from scratch.
+- `asr.transcribe(float32Audio, t0, t1)` — fire-and-forget. `t0`/`t1` are opaque to LocalASR — pass through whatever timestamps your source uses (e.g. MicVAD's `performance.now()`-based chunk bounds); they're echoed back unchanged on `'result'`/`'dropped'`. The audio buffer is transferred to the worker (zero-copy), so the array is unusable to the caller afterwards. Called with no live worker (before `init()`, after a failed init, or after `destroy()`), the job fires `'dropped'` instead of vanishing silently.
 - `asr.isReady` — live boolean, true once `init()` has resolved.
 - `asr.on(event, handler)` / `asr.off(event, handler)` — minimal inline event emitter, no dependencies.
-- `asr.destroy()` — terminates the worker and releases the model. Safe to call before `init()` or more than once.
+- `asr.destroy()` — terminates the worker and releases the model. Safe to call before `init()` or more than once. If `init()` is still pending, its promise rejects rather than hanging forever.
 
 ## Queue-drop policy
 
